@@ -11,6 +11,8 @@ from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
 
+import time
+
 if TYPE_CHECKING:
     from .model import Whisper
 
@@ -112,6 +114,10 @@ class DecodingOptions:
 
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
+
+    max_new_tokens: Optional[int] = None
+    repeat_penalty_tokens: Optional[int] = None
+    time_out: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -270,9 +276,10 @@ class TokenDecoder:
 
 
 class GreedyDecoder(TokenDecoder):
-    def __init__(self, temperature: float, eot: int):
+    def __init__(self, temperature: float, eot: int, options: DecodingOptions):
         self.temperature = temperature
         self.eot = eot
+        self.options = options
 
     def update(
         self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
@@ -288,6 +295,19 @@ class GreedyDecoder(TokenDecoder):
 
         next_tokens[tokens[:, -1] == self.eot] = self.eot
         tokens = torch.cat([tokens, next_tokens[:, None]], dim=-1)
+
+        # 반복 토큰(5개 이상 연속)이 감지되면 종료
+        if self.options.repeat_penalty_tokens:
+            n = self.options.repeat_penalty_tokens
+            if tokens.shape[-1] >= n:
+                last_n = tokens[:, -n:]
+                if (last_n == last_n[:, -1:]).all():
+                    return tokens, True
+
+        # 최대 토큰제한에 걸리면 종료
+        if self.options.max_new_tokens:
+            if tokens.shape[-1] >= self.options.max_new_tokens:
+                return tokens, True
 
         completed = (tokens[:, -1] == self.eot).all()
         return tokens, completed
@@ -548,7 +568,7 @@ class DecodingTask:
                 options.beam_size, tokenizer.eot, self.inference, options.patience
             )
         else:
-            self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
+            self.decoder = GreedyDecoder(options.temperature, tokenizer.eot, options=options)
 
         # logit filters: applies various rules to suppress or penalize certain tokens
         self.logit_filters = []
@@ -682,8 +702,16 @@ class DecodingTask:
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
 
+        timeout_sec = self.options.time_out
+        start_time = time.time()
+
         try:
             for i in range(self.sample_len):
+
+                if timeout_sec and (time.time() - start_time) > timeout_sec:
+                    print("User Timeout reached")
+                    break
+
                 logits = self.inference.logits(tokens, audio_features)
 
                 if (
